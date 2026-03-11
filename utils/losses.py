@@ -3,6 +3,11 @@ from utils import diff_operators, quaternion
 
 # uses real units
 
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
 
 def init_brt_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_type, use_MPC, MPC_finetune_lambda):
     def brt_hjivi_loss(
@@ -19,7 +24,7 @@ def init_brt_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_type
     ):
         # Curriculum training loss
         if dynamics.deepReach_model == "exact":
-            dirichlet_loss = torch.Tensor([0]).cuda()
+            dirichlet_loss = torch.Tensor([0]).to(device)
         else:
             dirichlet = value[dirichlet_mask] - boundary_value[dirichlet_mask]
             dirichlet_loss = torch.abs(dirichlet).sum() / dirichlet_loss_divisor
@@ -73,8 +78,8 @@ def init_brt_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_type
             raise NotImplementedError
 
         if torch.all(dirichlet_mask):  # pretraining loss
-            diff_constraint_hom = torch.Tensor([0]).cuda()
-            if use_MPC:
+            diff_constraint_hom = torch.Tensor([0]).to(device)
+            if use_MPC and MPC_values.ndim > 1:
                 dirichlet_loss += mpc_loss * 0.3
             elif dynamics.deepReach_model == "exact":
                 dirichlet = output.squeeze(dim=-1)[dirichlet_mask] - 0.0
@@ -115,7 +120,7 @@ def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_typ
     ):
         # Curriculum training loss
         if dynamics.deepReach_model == "exact":
-            dirichlet_loss = torch.Tensor([0]).cuda()
+            dirichlet_loss = torch.Tensor([0]).to(device)
         else:
             dirichlet = value[dirichlet_mask] - boundary_value[dirichlet_mask]
             dirichlet_loss = torch.abs(dirichlet).sum() / dirichlet_loss_divisor
@@ -153,7 +158,7 @@ def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_typ
             raise NotImplementedError
 
         if torch.all(dirichlet_mask):  # pretraining loss
-            diff_constraint_hom = torch.Tensor([0]).cuda()
+            diff_constraint_hom = torch.Tensor([0]).to(device)
             if use_MPC:
                 dirichlet_loss += mpc_loss * 0.3
             elif dynamics.deepReach_model == "exact":

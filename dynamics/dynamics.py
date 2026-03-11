@@ -13,6 +13,12 @@ import scipy.io as spio
 # in the future, code will need to be fixed to correctly handle parametrized models
 
 
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+
 class Dynamics(ABC):
     def __init__(
         self,
@@ -156,8 +162,26 @@ class Dynamics(ABC):
 
         return hes
 
-    def clamp_control(self, state, control):
+    def bound_control(self, control):
+        if hasattr(self, "control_range_"):
+            return torch.clamp(
+                control, self.control_range_[..., 0].to(control.device), self.control_range_[..., 1].to(control.device)
+            )
         return control
+
+    def clamp_control(self, state, control):
+        return self.bound_control(control)
+
+    def bound_disturbance(self, disturbance):
+        if hasattr(self, "disturbance_range_"):
+            return torch.clamp(disturbance, self.disturbance_range_[..., 0], self.disturbance_range_[..., 1])
+        return disturbance
+
+    def clamp_disturbance(self, state, disturbance):
+        return self.bound_disturbance(disturbance)
+
+    def clip_state(self, state):
+        return torch.clamp(state, self.state_range_[..., 0], self.state_range_[..., 1])
 
     def clamp_state_input(self, state_input):
         return state_input
@@ -181,6 +205,12 @@ class Dynamics(ABC):
     @abstractmethod
     def dsdt(self, state, control, disturbance):
         raise NotImplementedError
+
+    def get_boundary_values_tuple(self, state):
+        if self.set_mode == "reach_avoid":
+            return (self.avoid_fn(state), self.reach_fn(state))
+        else:
+            return (self.boundary_fn(state),)
 
     @abstractmethod
     def boundary_fn(self, state):
@@ -211,15 +241,153 @@ class Dynamics(ABC):
         raise NotImplementedError
 
 
+class ControlAndDisturbanceAffineDynamics(Dynamics):
+    """
+    Standard CtrlDistAffine system.
+    To implement:
+    - __init__ (with super().__init__)
+    - open_loop_dynamics
+    - control_jacobian
+    - disturbance_jacobian
+    - optimal_control
+    - optimal_disturbance
+    - boundary_fn
+
+    If dealing with periodic systems, implement:
+    - periodic_transform_fn
+    - equivalent_wrapped_state
+
+    If not doing avoid problems, implement:
+    - cost_fn
+    """
+
+    @abstractmethod
+    def open_loop_dynamics(self, state, time):
+        raise NotImplementedError
+
+    @abstractmethod
+    def control_jacobian(self, state, time):
+        raise NotImplementedError
+
+    @abstractmethod
+    def disturbance_jacobian(self, state, time):
+        raise NotImplementedError
+
+    def dsdt(self, state, control, disturbance):
+        ol = self.open_loop_dynamics(state, 0.0)
+
+        if disturbance is None:
+            disturbance = torch.empty(*control.shape[:-1], self.disturbance_dim).to(control.device)
+
+        # Get jacobians - these may have extra batch dims: [..., state_dim, control_dim]
+        control_jac = self.control_jacobian(state, 0.0)
+        disturbance_jac = self.disturbance_jacobian(state, 0.0)
+
+        # Flatten all batch dimensions for bmm (which requires exactly 3D)
+        original_shape = control_jac.shape[:-2]  # All dims before [state_dim, control_dim]
+        batch_size = original_shape.numel()
+
+        control_jac_flat = control_jac.reshape(batch_size, control_jac.shape[-2], control_jac.shape[-1])
+        control_flat = control.reshape(batch_size, -1)
+        disturbance_jac_flat = disturbance_jac.reshape(batch_size, disturbance_jac.shape[-2], disturbance_jac.shape[-1])
+        disturbance_flat = disturbance.reshape(batch_size, -1)
+
+        # Apply bmm
+        c_flat = torch.bmm(control_jac_flat, control_flat.unsqueeze(-1)).squeeze(-1)
+        d_flat = torch.bmm(disturbance_jac_flat, disturbance_flat.unsqueeze(-1)).squeeze(-1)
+
+        # Reshape back to original batch shape
+        c = c_flat.reshape(*original_shape, -1)
+        d = d_flat.reshape(*original_shape, -1)
+
+        return ol + c + d
+
+    def hamiltonian(self, state, dvds):
+        opt_control = self.optimal_control(state, dvds)
+        opt_disturbance = self.optimal_disturbance(state, dvds)
+        flow = self.dsdt(state.squeeze(0), opt_control, opt_disturbance)
+        return torch.sum(flow * dvds, dim=-1)
+
+    def equivalent_wrapped_state(self, state):
+        return state
+
+    def periodic_transform_fn(self, input):
+        return input.to(device)
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def control_range(self, state):
+        return self.control_range_.tolist()
+
+    def disturbance_range(self, state):
+        return self.disturbance_range_.tolist()
+
+    def bound_control(self, control):
+        return torch.clamp(control, self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def clamp_control(self, state, control):
+        return self.bound_control(control)
+
+    def bound_disturbance(self, disturbance):
+        return torch.clamp(disturbance, self.disturbance_range_[..., 0], self.disturbance_range_[..., 1])
+
+    def clamp_disturbance(self, state, disturbance):
+        return self.bound_disturbance(disturbance)
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    def optimal_control(self, state, dvds):
+        """Default optimal control via control_jacobian.
+
+        For each control dimension i, computes the inner product
+        sum_j control_jacobian[..., j, i] * dvds[..., j].
+        Then selects the extreme control value based on set_mode (bang-bang).
+        """
+        jac = self.control_jacobian(state, 0.0)  # [..., state_dim, control_dim]
+        terms = torch.sum(jac * dvds.unsqueeze(-1), dim=-2)  # [..., control_dim]
+        if self.set_mode == "avoid":
+            return torch.where(terms > 0, self.control_range_[:, 1], self.control_range_[:, 0])
+        elif self.set_mode == "reach":
+            return torch.where(terms < 0, self.control_range_[:, 1], self.control_range_[:, 0])
+        else:
+            raise NotImplementedError(f"optimal_control not implemented for set_mode={self.set_mode}")
+
+    def optimal_disturbance(self, state, dvds):
+        """Default optimal disturbance via disturbance_jacobian.
+
+        For each disturbance dimension i, computes the inner product
+        sum_j disturbance_jacobian[..., j, i] * dvds[..., j].
+        Then selects the extreme disturbance value based on set_mode (bang-bang).
+        """
+        if self.disturbance_dim == 0:
+            return torch.zeros_like(state[..., :0])
+        jac = self.disturbance_jacobian(state, 0.0)  # [..., state_dim, disturbance_dim]
+        terms = torch.sum(jac * dvds.unsqueeze(-1), dim=-2)  # [..., disturbance_dim]
+        if self.set_mode == "avoid":
+            return torch.where(terms < 0, self.disturbance_range_[:, 1], self.disturbance_range_[:, 0])
+        elif self.set_mode == "reach":
+            return torch.where(terms > 0, self.disturbance_range_[:, 1], self.disturbance_range_[:, 0])
+        else:
+            raise NotImplementedError(f"optimal_disturbance not implemented for set_mode={self.set_mode}")
+
+
 class VertDrone2D(Dynamics):
     def __init__(self):
         self.gravity = 9.8  # g
         self.input_multiplier = 12.0  # K
         self.input_magnitude_max = 1.0  # u_max
-        self.state_range_ = torch.tensor([[-4, 4], [-0.5, 3.5]]).cuda()  # v, z, k
-        self.control_range_ = torch.tensor([[-self.input_magnitude_max, self.input_magnitude_max]]).cuda()
-        self.eps_var = torch.tensor([2]).cuda()
-        self.control_init = torch.ones(1).cuda() * self.gravity / self.input_multiplier
+        self.state_range_ = torch.tensor([[-4, 4], [-0.5, 3.5]]).to(device)  # v, z, k
+        self.control_range_ = torch.tensor([[-self.input_magnitude_max, self.input_magnitude_max]]).to(device)
+        self.eps_var_control = torch.tensor([2]).to(device)
+        self.control_init = (torch.ones(1) * self.gravity / self.input_multiplier).to(device)
 
         state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
         state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
@@ -255,7 +423,7 @@ class VertDrone2D(Dynamics):
         return wrapped_state
 
     def periodic_transform_fn(self, input):
-        return input.cuda()
+        return input.to(device)
 
     # ParameterizedVertDrone2D dynamics
     # \dot v = k*u - g
@@ -298,15 +466,60 @@ class VertDrone2D(Dynamics):
         }
 
 
+class VertDrone2DWithDist(VertDrone2D):
+    disturbance_dim = 1
+
+    def __init__(self, max_disturbance: float):
+        self.disturbance_magnitude_max = max_disturbance
+        self.disturbance_range_ = torch.tensor([-self.disturbance_magnitude_max, self.disturbance_magnitude_max]).to(
+            device
+        )
+        self.disturbance_init = torch.zeros(1).to(device)
+        self.eps_var_disturbance = torch.tensor([2]).to(device)
+
+        super().__init__()
+        self.disturbance_dim = 1
+
+    def disturbance_range(self, state):
+        return [[-self.disturbance_magnitude_max, self.disturbance_magnitude_max]]
+
+    def clamp_disturbance(self, state, disturbance):
+        return self.bound_disturbance(disturbance)
+
+    def bound_disturbance(self, disturbance):
+        return torch.clamp(
+            disturbance,
+            self.disturbance_range_[..., 0],
+            self.disturbance_range_[..., 1],
+        )
+
+    def dsdt(self, state, control, disturbance):
+        dsdt = torch.zeros_like(state)
+        dsdt[..., 0] = self.input_multiplier * control[..., 0] - self.gravity
+        dsdt[..., 1] = state[..., 0] + disturbance[..., 0]
+        return dsdt
+
+    def hamiltonian(self, state, dvds):
+        return (
+            torch.abs(self.input_multiplier * dvds[..., 0]) * self.input_magnitude_max
+            - dvds[..., 0] * self.gravity
+            + dvds[..., 1] * state[..., 0]
+            - torch.abs(dvds[..., 1]) * self.disturbance_magnitude_max
+        )
+
+    def optimal_disturbance(self, state, dvds):
+        return -(torch.sign(dvds[..., 1]) * self.disturbance_magnitude_max)[..., None]
+
+
 class ParameterizedVertDrone2D(Dynamics):
     def __init__(self, gravity: float, input_multiplier: float, input_magnitude_max: float):
         self.gravity = gravity  # g
         self.input_multiplier = input_multiplier  # k_max
         self.input_magnitude_max = input_magnitude_max  # u_max
-        self.state_range_ = torch.tensor([[-4, 4], [-0.5, 3.5], [0, self.input_multiplier]]).cuda()  # v, z, k
-        self.control_range_ = torch.tensor([[-self.input_magnitude_max, self.input_magnitude_max]]).cuda()
-        self.eps_var = torch.tensor([2]).cuda()
-        self.control_init = torch.ones(1).cuda() * gravity / input_multiplier
+        self.state_range_ = torch.tensor([[-4, 4], [-0.5, 3.5], [0, self.input_multiplier]]).to(device)  # v, z, k
+        self.control_range_ = torch.tensor([[-self.input_magnitude_max, self.input_magnitude_max]]).to(device)
+        self.eps_var_control = torch.tensor([2]).to(device)
+        self.control_init = (torch.ones(1) * gravity / input_multiplier).to(device)
 
         state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
         state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
@@ -341,7 +554,7 @@ class ParameterizedVertDrone2D(Dynamics):
         return wrapped_state
 
     def periodic_transform_fn(self, input):
-        return input.cuda()
+        return input.to(device)
 
     # ParameterizedVertDrone2D dynamics
     # \dot v = k*u - g
@@ -391,10 +604,10 @@ class Dubins3D(Dynamics):
         self.goalR = 0.5
         self.velocity = 1.0
         self.omega_max = 1.2
-        self.state_range_ = torch.tensor([[-1, 1], [-1, 1], [-math.pi, math.pi]]).cuda()
-        self.control_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).cuda()
-        self.eps_var = torch.tensor([1]).cuda()
-        self.control_init = torch.zeros(1).cuda()
+        self.state_range_ = torch.tensor([[-1, 1], [-1, 1], [-math.pi, math.pi]]).to(device)
+        self.control_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).to(device)
+        self.eps_var_control = torch.tensor([1]).to(device)
+        self.control_init = torch.zeros(1).to(device)
         self.set_mode = set_mode
 
         state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
@@ -436,7 +649,7 @@ class Dubins3D(Dynamics):
         transformed_input[..., :3] = input[..., :3]
         transformed_input[..., 3] = torch.sin(input[..., 3] * self.state_var[-1])
         transformed_input[..., 4] = torch.cos(input[..., 3] * self.state_var[-1])
-        return transformed_input.cuda()
+        return transformed_input.to(device)
 
     # Dubins3D dynamics
     # \dot x    = v \cos \theta
@@ -529,7 +742,7 @@ class Quadrotor(Dynamics):
                 [-5.0, 5.0],
                 [-5.0, 5.0],
             ]
-        ).cuda()
+        ).to(device)
         self.control_range_ = torch.tensor(
             [
                 [-self.collective_thrust_max, self.collective_thrust_max],
@@ -537,9 +750,9 @@ class Quadrotor(Dynamics):
                 [-self.dwy_max, self.dwy_max],
                 [-self.dwz_max, self.dwz_max],
             ]
-        ).cuda()
-        self.eps_var = torch.tensor([20, 8, 8, 4]).cuda()
-        self.control_init = torch.tensor([-self.Gz * 0.0, 0, 0, 0]).cuda()
+        ).to(device)
+        self.eps_var_control = torch.tensor([20, 8, 8, 4]).to(device)
+        self.control_init = torch.tensor([-self.Gz * 0.0, 0, 0, 0]).to(device)
 
         state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
         state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
@@ -589,7 +802,7 @@ class Quadrotor(Dynamics):
         return self.state_range_.cpu().tolist()
 
     def periodic_transform_fn(self, input):
-        return input.cuda()
+        return input.to(device)
 
     def equivalent_wrapped_state(self, state):
         wrapped_state = torch.clone(state)
@@ -866,10 +1079,10 @@ class F1tenth(Dynamics):
                 [-self.omega_max, self.omega_max],
                 [-1, 1],
             ]
-        ).cuda()
-        self.control_range_ = torch.tensor([[self.sv_min, self.sv_max], [-self.a_max, self.a_max]]).cuda()
-        self.eps_var = torch.tensor([self.sv_max**2, self.a_max**2]).cuda()
-        self.control_init = torch.tensor([0.0, 0.0]).cuda()
+        ).to(device)
+        self.control_range_ = torch.tensor([[self.sv_min, self.sv_max], [-self.a_max, self.a_max]]).to(device)
+        self.eps_var_control = torch.tensor([self.sv_max**2, self.a_max**2]).to(device)
+        self.control_init = torch.tensor([0.0, 0.0]).to(device)
 
         # for the track
         self.obstaclemap_file = "dynamics/F1_map_obstaclemap.mat"
@@ -928,7 +1141,7 @@ class F1tenth(Dynamics):
         transformed_input[..., 5] = torch.sin(input[..., 5] * self.state_var[4])
         transformed_input[..., 6] = torch.cos(input[..., 5] * self.state_var[4])
         transformed_input[..., 7:] = input[..., 6:]
-        return transformed_input.cuda()
+        return transformed_input.to(device)
 
     def dsdt(self, state, control, disturbance):
         # here the control is steering angle v and acceleration
@@ -1394,9 +1607,9 @@ class LessLinearND(Dynamics):
         self.A = (
             -0.5 * torch.eye(N)
             - torch.cat((torch.cat((torch.zeros(1, 1), torch.ones(N - 1, 1)), 0), torch.zeros(N, N - 1)), 1)
-        ).cuda()
-        self.B = torch.cat((torch.zeros(1, N - 1), 0.4 * torch.eye(N - 1)), 0).cuda()
-        self.Bumax = u_max * torch.matmul(self.B, torch.ones(self.N - 1).cuda()).unsqueeze(0).unsqueeze(0).cuda()
+        ).to(device)
+        self.B = torch.cat((torch.zeros(1, N - 1), 0.4 * torch.eye(N - 1)), 0).to(device)
+        self.Bumax = u_max * torch.matmul(self.B, torch.ones(self.N - 1).to(device)).unsqueeze(0).unsqueeze(0).to(device)
         self.C = torch.cat((torch.zeros(1, N - 1), 0.1 * torch.eye(N - 1)), 0)
         self.gamma, self.mu, self.alpha = gamma, mu, alpha
         self.gamma_orig, self.mu_orig, self.alpha_orig = gamma, mu, alpha
@@ -1407,10 +1620,10 @@ class LessLinearND(Dynamics):
             (((N - 1) ** 0.5) * torch.ones(1), torch.ones(N - 1) / 1.0), 0
         )  # accounts for N-dimensional combination
 
-        self.state_range_ = torch.tensor([[-1, 1] for _ in range(self.N)]).cuda()
-        self.control_range_ = torch.tensor([[-u_max, u_max] for _ in range(self.N - 1)]).cuda()
-        self.eps_var = torch.tensor([u_max for _ in range(self.N - 1)]).cuda()
-        self.control_init = torch.tensor([0.0 for _ in range(self.N - 1)]).cuda()
+        self.state_range_ = torch.tensor([[-1, 1] for _ in range(self.N)]).to(device)
+        self.control_range_ = torch.tensor([[-u_max, u_max] for _ in range(self.N - 1)]).to(device)
+        self.eps_var_control = torch.tensor([u_max for _ in range(self.N - 1)]).to(device)
+        self.control_init = torch.tensor([0.0 for _ in range(self.N - 1)]).to(device)
 
         super().__init__(
             name="50D system",
@@ -1476,12 +1689,12 @@ class LessLinearND(Dynamics):
         return linear_term + nl_term
 
     def periodic_transform_fn(self, input):
-        return input.cuda()
+        return input.to(device)
 
     def boundary_fn(self, state):
         if self.ellipse_params.device != state.device:  # FIXME: Patch to cover de/attached state bug
             if state.device.type == "cuda":
-                self.ellipse_params = self.ellipse_params.cuda()
+                self.ellipse_params = self.ellipse_params.to(device)
             else:
                 self.ellipse_params = self.ellipse_params.cpu()
         return 0.5 * (torch.square(torch.norm(self.ellipse_params * state[..., :], dim=-1)) - (self.goalR**2))
@@ -1518,6 +1731,191 @@ class LessLinearND(Dynamics):
         return {
             "state_slices": [0 for _ in range(self.N)],
             "state_labels": ["xN"] + ["x" + str(i) for i in range(1, self.N)],
+            "x_axis_idx": 0,
+            "y_axis_idx": 1,
+            "z_axis_idx": 2,
+        }
+
+
+class Air3D(Dynamics):
+    def __init__(self, set_mode: str):
+        self.goalR = 0.25
+        self.evader_velocity = 0.6
+        self.pursuer_velocity = 0.6
+
+        self.omega_max = 2.0
+        self.goalR = 0.25
+        self.state_max = 1.5
+        self.state_range_ = torch.tensor(
+            [[-self.state_max, self.state_max], [-self.state_max, self.state_max], [-math.pi, math.pi]]
+        ).to(device)
+        self.control_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).to(device)
+        self.disturbance_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).to(device)
+
+        self.control_init = torch.zeros(1).to(device)
+        self.disturbance_init = torch.zeros(1).to(device)
+        self.set_mode = set_mode
+        self.eps_var_control = torch.tensor([1]).to(device)
+        self.eps_var_disturbance = torch.tensor([1]).to(device)
+
+        state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
+        state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
+
+        super().__init__(
+            name="Air3D",
+            loss_type="brt_hjivi",
+            set_mode=set_mode,
+            state_dim=3,
+            input_dim=5,
+            control_dim=1,
+            disturbance_dim=1,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),
+            value_mean=0.5,
+            value_var=1,
+            value_normto=0.02,
+            deepReach_model="exact",
+        )
+
+    def control_range(self, state):
+        return self.control_range_.cpu().tolist()
+
+    def disturbance_range(self, state):
+        return self.disturbance_range_.cpu().tolist()
+
+    def clamp_disturbance(self, state, disturbance):
+        return self.bound_disturbance(disturbance)
+
+    def bound_disturbance(self, disturbance):
+        return torch.clamp(
+            disturbance,
+            self.disturbance_range_[..., 0],
+            self.disturbance_range_[..., 1],
+        )
+
+    def clip_state(self, state):
+        return torch.clamp(state, self.state_range_[..., 0], self.state_range_[..., 1])
+
+    def bound_control(self, control):
+        return torch.clamp(control, self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def clamp_control(self, state, control):
+        return self.bound_control(control)
+
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        output_shape = list(input.shape)
+        output_shape[-1] = output_shape[-1] + 1
+        transformed_input = torch.zeros(output_shape)
+
+        transformed_input[..., :3] = input[..., :3]
+        transformed_input[..., 3] = torch.sin(input[..., 3] * self.state_var[-1])
+        transformed_input[..., 4] = torch.cos(input[..., 3] * self.state_var[-1])
+        return transformed_input.to(device)
+
+    def dsdt(self, state, control, disturbance):
+        dsdt = torch.zeros_like(state)
+
+        # state = [x1, x2, x3]
+        # control = a (evader)
+        # disturbance = b (pursuer)
+
+        x1, x2, x3 = state[..., 0], state[..., 1], state[..., 2]
+        a = control[..., 0]
+        b = disturbance[..., 0]
+        va = self.evader_velocity
+        vb = self.pursuer_velocity
+
+        dx1 = -va + vb * torch.cos(x3) + a * x2
+        dx2 = vb * torch.sin(x3) - a * x1
+        dx3 = b - a
+
+        dsdt[..., 0] = dx1
+        dsdt[..., 1] = dx2
+        dsdt[..., 2] = dx3
+
+        return dsdt
+
+    def boundary_fn(self, state):
+        return torch.norm(state[..., :2], dim=-1) - self.goalR
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    def hamiltonian(self, state, dvds):
+        # H(x,p)=f(x,a,b)⋅p= (−va​+vb​cosx3​+ax2​)p1​+(vb​sinx3​−ax1​)p2​+(b−a)p3
+
+        x1 = state[..., 0]
+        x2 = state[..., 1]
+        x3 = state[..., 2]
+
+        dVdx1 = dvds[..., 0]
+        dVdx2 = dvds[..., 1]
+        dVdx3 = dvds[..., 2]
+
+        va = self.evader_velocity
+        vb = self.pursuer_velocity
+        w_max = self.omega_max
+
+        base = -va * dVdx1 + vb * torch.cos(x3) * dVdx1 + vb * torch.sin(x3) * dVdx2
+
+        # a (evader control) terms
+        a_terms = x2 * dVdx1 - x1 * dVdx2 - dVdx3
+        # b (pursuer control) term
+        b_term = dVdx3
+
+        if self.set_mode == "avoid":
+            # max_a min_b H  ⇒ evader (a) maximizes, pursuer (b) minimizes
+            return base + w_max * torch.abs(a_terms) - w_max * torch.abs(b_term)
+        elif self.set_mode == "reach":
+            # min_a max_b H ⇒ evader (a) minimizes, pursuer (b) maximizes
+            return base - w_max * torch.abs(a_terms) + w_max * torch.abs(b_term)
+        else:
+            raise NotImplementedError
+
+    def optimal_control(self, state, dvds):
+        x1 = state[..., 0]
+        x2 = state[..., 1]
+        dVdx1 = dvds[..., 0]
+        dVdx2 = dvds[..., 1]
+        dVdx3 = dvds[..., 2]
+
+        term = x2 * dVdx1 - x1 * dVdx2 - dVdx3
+
+        if self.set_mode == "avoid":
+            return (self.omega_max * torch.sign(term))[..., None]
+        elif self.set_mode == "reach":
+            return -(self.omega_max * torch.sign(term))[..., None]
+        else:
+            raise NotImplementedError
+
+    def optimal_disturbance(self, state, dvds):
+        dVdx3 = dvds[..., 2]
+
+        if self.set_mode == "avoid":
+            return -(self.omega_max * torch.sign(dVdx3))[..., None]
+        elif self.set_mode == "reach":
+            return (self.omega_max * torch.sign(dVdx3))[..., None]
+        else:
+            raise NotImplementedError
+
+    def plot_config(self):
+        return {
+            "state_slices": [0, 0, 0],
+            "state_labels": ["x₁", "x₂", r"$x_3$"],
             "x_axis_idx": 0,
             "y_axis_idx": 1,
             "z_axis_idx": 2,

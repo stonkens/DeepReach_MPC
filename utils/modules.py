@@ -217,7 +217,7 @@ class Combined_model(nn.Module):
         # v = self.modelA(x)['model_out'].clone().detach().requires_grad_(True)
         # # print(coords_org.size(),v['model_out'].size())
         # coords_aug = torch.cat((coords_org,v), dim=2)
-        # result=self.modelB({'coords': coords_aug.cuda()})
+        # result=self.modelB({'coords': coords_aug.to(device)})
         # return {'model_in': coords_org, 'model_out': result['model_out']}
         coords_org = x["coords"].clone().detach().requires_grad_(True)
         v = self.modelA.net(coords_org)

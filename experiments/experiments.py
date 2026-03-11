@@ -25,8 +25,15 @@ from utils.error_evaluators import (
     MLP,
     MLPValidator,
     SliceSampleGenerator,
+    FixedStateSampleGenerator,
 )
+from experiments.validation import run_training_validation
 import seaborn as sns
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
 
 
 class Experiment(ABC):
@@ -109,18 +116,26 @@ class Experiment(ABC):
 
         total_steps = 0
 
-        self.last_refine_time = (
-            math.floor(
-                min(1.0, self.dataset.counter / self.dataset.counter_end)
-                * (self.dataset.tMax - self.dataset.tMin)
-                / self.dataset.time_till_refinement
+        if self.dataset.refinement_schedule is not None:
+            # With schedule-based refinement, track the last actual refinement time
+            self.last_refine_time = 0.0
+            self.refinement_schedule_index = 0
+        else:
+            # Original constant interval logic
+            self.last_refine_time = (
+                math.floor(
+                    min(1.0, self.dataset.counter / self.dataset.counter_end)
+                    * (self.dataset.tMax - self.dataset.tMin)
+                    / self.dataset.time_till_refinement
+                )
+                * self.dataset.time_till_refinement
             )
-            * self.dataset.time_till_refinement
-        )
         self.use_MPC_terminal_loss = False
 
         with tqdm(total=len(train_dataloader) * epochs) as pbar:
             train_losses = []
+            first_time_generated = True
+            # self.dataset.counter = 0
             for epoch in range(0, epochs):
                 # if current epochs exceed the counter end, then we train with t \in [tMin,tMax]
                 time_interval_length = min(1.0, self.dataset.counter / self.dataset.counter_end) * (
@@ -128,14 +143,14 @@ class Experiment(ABC):
                 )
 
                 if self.dataset.refine_dataset:
-                    self.dataset_refinement(time_interval_length, epoch)
+                    self.dataset_refinement(time_interval_length, epoch, epochs)
 
                 # semi-supervised learning
                 for step, (model_input, gt) in enumerate(train_dataloader):
                     start_time = time.time()
 
-                    model_input = {key: value.cuda() for key, value in model_input.items()}
-                    gt = {key: value.cuda() for key, value in gt.items()}
+                    model_input = {key: value.to(device) for key, value in model_input.items()}
+                    gt = {key: value.to(device) for key, value in gt.items()}
 
                     model_results = self.model({"coords": model_input["model_inputs"]})
 
@@ -158,7 +173,7 @@ class Experiment(ABC):
                         )
 
                     else:
-                        MPC_values = torch.Tensor([0]).cuda()
+                        MPC_values = torch.Tensor([0]).to(device)
 
                     # Compute losses
                     boundary_values = gt["boundary_values"]
@@ -244,7 +259,8 @@ class Experiment(ABC):
                                     "mpc_loss": losses["mpc_loss"] / self.dataset.num_MPC_data_samples,
                                     "mpc_importance": self.mpc_importance_coef,
                                     "mpc_weight": self.loss_weights["mpc_loss"],
-                                }
+                                },
+                                step=epoch,
                             )
 
                     total_steps += 1
@@ -269,8 +285,27 @@ class Experiment(ABC):
                         z_resolution=val_z_resolution,
                         time_resolution=val_time_resolution,
                     )
-
-        torch.save(checkpoint, os.path.join(checkpoints_dir, "model_final.pth"))  # save final model
+                    # Run scenario_optimization validation at multiple time horizons
+                    current_time = (self.dataset.tMax - self.dataset.tMin) * min(
+                        (self.dataset.counter + 1) / self.dataset.counter_end, 1.0
+                    )
+                    if first_time_generated:
+                        cached_validation_states = None
+                        first_time_generated = False
+                    cached_validation_states = run_training_validation(
+                        model=self.model,
+                        dynamics=self.dataset.dynamics,
+                        tMin=self.dataset.tMin,
+                        tMax=self.dataset.tMax,
+                        current_time=current_time,
+                        use_wandb=self.use_wandb,
+                        epoch=epoch + 1,
+                        cached_states=cached_validation_states if not first_time_generated else None,
+                    )
+ 
+        torch.save(
+            {"model": self.model.state_dict()}, os.path.join(checkpoints_dir, "model_final.pth")
+        )  # save final model
 
         if was_eval:
             self.model.eval()
@@ -474,8 +509,8 @@ class Experiment(ABC):
             dynamics = dataset.dynamics
 
             if data_step == "eval_w_gt":
-                coords = torch.load(os.path.join(gt_data_path, "coords.pt")).cuda()
-                gt_values = torch.load(os.path.join(gt_data_path, "gt_values.pt")).cuda()
+                coords = torch.load(os.path.join(gt_data_path, "coords.pt")).to(device)
+                gt_values = torch.load(os.path.join(gt_data_path, "gt_values.pt")).to(device)
                 with torch.no_grad():
                     results = model({"coords": self.dataset.dynamics.coord_to_input(coords)})
                     pred_values = self.dataset.dynamics.io_to_value(
@@ -878,7 +913,7 @@ class Experiment(ABC):
                     coords[:, 2:] = (xys[:, 1] * torch.ones(self.dataset.dynamics.N - 1, xys.size()[0])).t()
 
                     with torch.no_grad():
-                        model_results = self.model({"coords": self.dataset.dynamics.coord_to_input(coords.cuda())})
+                        model_results = self.model({"coords": self.dataset.dynamics.coord_to_input(coords.to(device))})
                         values = self.dataset.dynamics.io_to_value(
                             model_results["model_in"].detach(), model_results["model_out"].squeeze(dim=-1).detach()
                         )
@@ -978,7 +1013,7 @@ class Experiment(ABC):
             coords[:, 1 + plot_config["y_axis_idx"]] = xys[:, 1]
 
             with torch.no_grad():
-                model_results = self.model({"coords": self.dataset.dynamics.coord_to_input(coords.cuda())})
+                model_results = self.model({"coords": self.dataset.dynamics.coord_to_input(coords.to(device))})
 
                 values = self.dataset.dynamics.io_to_value(
                     model_results["model_in"].detach(), model_results["model_out"].squeeze(dim=-1).detach()
@@ -998,7 +1033,7 @@ class Experiment(ABC):
             }
             ax.imshow(BRT_img, **imshow_kwargs)
             lx = (
-                self.dataset.dynamics.boundary_fn(coords.cuda()[..., 1:])
+                self.dataset.dynamics.boundary_fn(coords.to(device)[..., 1:])
                 .detach()
                 .cpu()
                 .numpy()
@@ -1038,7 +1073,7 @@ class Experiment(ABC):
                 coords[:, 1 + plot_config["z_axis_idx"]] = zs[j]
 
                 lx = (
-                    self.dataset.dynamics.boundary_fn(coords.cuda()[..., 1:])
+                    self.dataset.dynamics.boundary_fn(coords.to(device)[..., 1:])
                     .detach()
                     .cpu()
                     .numpy()
@@ -1046,7 +1081,7 @@ class Experiment(ABC):
                     .T
                 )
                 with torch.no_grad():
-                    model_results = self.model({"coords": self.dataset.dynamics.coord_to_input(coords.cuda())})
+                    model_results = self.model({"coords": self.dataset.dynamics.coord_to_input(coords.to(device))})
                     values = self.dataset.dynamics.io_to_value(
                         model_results["model_in"].detach(), model_results["model_out"].squeeze(dim=-1).detach()
                     )
@@ -1088,23 +1123,26 @@ class Experiment(ABC):
         self.model.eval()
         self.model.requires_grad_(False)
 
-        plot_config = self.dataset.dynamics.plot_config()
-
-        state_test_range = self.dataset.dynamics.state_test_range()
-        times = torch.linspace(0, self.dataset.tMax, time_resolution)
-        if plot_config["z_axis_idx"] == -1:
-            fig = self.plotSingleFig(state_test_range, plot_config, x_resolution, y_resolution, times)
+        plot_config_raw = self.dataset.dynamics.plot_config()
+        if "0" not in plot_config_raw.keys():
+            # Not a nested dictionary
+            plot_configs = dict()
+            plot_configs["0"] = plot_config_raw
         else:
-            fig = self.plotMultipleFigs(state_test_range, plot_config, x_resolution, y_resolution, z_resolution, times)
-        if self.use_wandb:
-            wandb.log(
-                {
-                    "step": epoch,
-                    "val_plot": wandb.Image(fig),
-                }
-            )
-        plt.close()
-        plt.close()
+            plot_configs = plot_config_raw
+        for key, plot_config in plot_configs.items():
+            state_test_range = self.dataset.dynamics.state_test_range()
+            times = torch.linspace(0, self.dataset.tMax, time_resolution)
+            if plot_config["z_axis_idx"] == -1:
+                fig = self.plotSingleFig(state_test_range, plot_config, x_resolution, y_resolution, times)
+            else:
+                fig = self.plotMultipleFigs(
+                    state_test_range, plot_config, x_resolution, y_resolution, z_resolution, times
+                )
+            if self.use_wandb:
+                wandb.log({"val_plot_{}".format(key): wandb.Image(fig)}, step=epoch)
+            plt.close()
+            plt.close()
         if was_training:
             self.model.train()
             self.model.requires_grad_(True)
@@ -1224,20 +1262,47 @@ class Experiment(ABC):
                 0.9 * self.loss_weights["mpc_loss"] + 0.1 * self.mpc_importance_coef * num / (den + 1e-16), 1e5
             )
 
-    def dataset_refinement(self, time_interval_length, epoch):
-        if time_interval_length >= (self.last_refine_time + self.dataset.time_till_refinement) and self.dataset.use_MPC:
-            # If we reach H_R (time_till_refinement), then we generate a new dataset
-            # with an extra H_R horizon by leveraging the learned value function
-            self.last_refine_time += self.dataset.time_till_refinement
-            # update deepreach model
-            self.dataset.policy = self.model
-            # update data
-            if time_interval_length < self.dataset.tMax:
-                refine_till_t = (
-                    time_interval_length + self.dataset.time_till_refinement
-                )  # new total horizon, note that MPC effective horizon = H_R
-                self.dataset.generate_MPC_dataset(refine_till_t, time_interval_length, style="random")
+    def dataset_refinement(self, current_curriculum_time, epoch, epochs):
+        # Handle refinement based on schedule or constant interval
+        should_refine = False
+        next_refine_time = None
 
+        if self.dataset.refinement_schedule is not None:
+            # Schedule-based refinement
+            if hasattr(self, "refinement_schedule_index") and self.refinement_schedule_index < len(
+                self.dataset.refinement_schedule
+            ):
+                next_refine_time = self.dataset.refinement_schedule[self.refinement_schedule_index]
+                should_refine = current_curriculum_time >= next_refine_time
+            else:
+                should_refine = False
+        else:
+            # Original constant interval logic
+            should_refine = current_curriculum_time >= (self.last_refine_time + self.dataset.time_till_refinement)
+            if should_refine:
+                next_refine_time = self.last_refine_time + self.dataset.time_till_refinement
+
+        if should_refine and self.dataset.use_MPC:
+            # Update refinement tracking
+            if self.dataset.refinement_schedule is not None:
+                self.last_refine_time = next_refine_time
+                self.refinement_schedule_index += 1
+                # Determine next horizon to train up to
+                if self.refinement_schedule_index < len(self.dataset.refinement_schedule):
+                    refine_till_t = self.dataset.refinement_schedule[self.refinement_schedule_index]
+                else:
+                    refine_till_t = self.dataset.tMax  # No more scheduled refinements
+            else:
+                # Original logic
+                self.last_refine_time += self.dataset.time_till_refinement
+                refine_till_t = self.last_refine_time + self.dataset.time_till_refinement
+
+            # Update deepreach model
+            self.dataset.policy = self.model
+
+            # Generate new dataset
+            if refine_till_t < self.dataset.tMax:
+                self.dataset.generate_MPC_dataset(refine_till_t, self.last_refine_time, style="random")
             else:  # take extra care when time curriculum end, and transition to finetuning phase
                 self.dataset.use_terminal_MPC()
                 for g in self.optim.param_groups:
@@ -1251,7 +1316,7 @@ class Experiment(ABC):
                 self.dataset.generate_MPC_dataset(refine_till_t, refine_till_t, style="terminal")
 
         if (
-            time_interval_length >= self.dataset.tMax
+            current_curriculum_time >= self.dataset.tMax
             and epoch % self.dataset.epoch_till_refinement == 0
             and self.dataset.use_MPC
         ):
@@ -1324,7 +1389,7 @@ class Experiment(ABC):
             if dataset.dynamics.state_dim > 2:
                 coords[:, 1 + plot_config["z_axis_idx"]] = zs[i]
 
-            model_results = model({"coords": dataset.dynamics.coord_to_input(coords.cuda())})
+            model_results = model({"coords": dataset.dynamics.coord_to_input(coords.to(device))})
             values = (
                 dataset.dynamics.io_to_value(
                     model_results["model_in"].detach(), model_results["model_out"].detach().squeeze(dim=-1)

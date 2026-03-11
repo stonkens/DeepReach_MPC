@@ -13,6 +13,12 @@ from dynamics import dynamics
 from experiments import experiments
 from utils import modules, dataio, losses
 
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+
 p = configargparse.ArgumentParser()
 p.add_argument("-c", "--config_filepath", required=False, is_config_file=True, help="Path to config file.")
 p.add_argument(
@@ -149,7 +155,16 @@ if (mode == "all") or (mode == "train"):
 
     # MPC dataset generation
     p.add_argument(
-        "--time_till_refinement", type=float, default=0.2, help="H_R in the paper, which is the effective MPC horizon"
+        "--time_till_refinement",
+        type=float,
+        default=0.2,
+        help="H_R in the paper, which is the effective MPC horizon (used when refinement_schedule is not provided)",
+    )
+    p.add_argument(
+        "--refinement_schedule",
+        type=str,
+        default=None,
+        help='Comma-separated list of refinement times (e.g., "0,0.05,0.10,0.15,0.2,0.4,0.6,0.8,1.0"). If provided, overrides time_till_refinement.',
     )
     p.add_argument(
         "--MPC_batch_size", type=int, default=10000, help="generate MPC data with N init states in a parallel manner"
@@ -186,6 +201,36 @@ if (mode == "all") or (mode == "train"):
         default="none",
         required=False,
         help="MPC data path, where inputs.pt and value_labels.pt exist. Note that inputs.pt is normalized. Specify when using your own dataset",
+    )
+    p.add_argument(
+        "--no_MPC_disturbance_samples",
+        default=False,
+        action="store_true",
+        help="not include disturbance samples for MPC optimization",
+    )
+    p.add_argument(
+        "--not_pretrain_MPC",
+        action="store_true",
+        default=False,
+        help="Whether to have MPC from time = 0.0, or start with only SSL",
+    )
+    p.add_argument(
+        "--MPC_warm_start_only",
+        action="store_true",
+        default=False,
+        help="Run only warm-start iterations and skip full-horizon MPC refinement",
+    )
+    p.add_argument(
+        "--num_warm_start_iters",
+        type=int,
+        default=0,
+        help="Iterations of MPC w/ cost-to-go (not running MPC past the current learned time)",
+    )
+    p.add_argument(
+        "--num_full_horizon_iters",
+        type=int,
+        default=0,
+        help="Iterations of MPC optimization run on the full-horizon",
     )
 
     """parameters that you probably don't need to pay attention"""
@@ -307,7 +352,7 @@ if (mode == "all") or (mode == "train"):
     dynamics_classes_dict = {
         name: clss
         for name, clss in inspect.getmembers(dynamics, inspect.isclass)
-        if clss.__bases__[0] == dynamics.Dynamics
+        if issubclass(clss, dynamics.Dynamics) and clss != dynamics.Dynamics
     }
     p.add_argument(
         "--dynamics_class", type=str, required=True, choices=dynamics_classes_dict.keys(), help="Dynamics class to use."
@@ -318,20 +363,25 @@ if (mode == "all") or (mode == "train"):
         name: param for name, param in inspect.signature(dynamics_class).parameters.items() if name != "self"
     }
     for param in dynamics_params.keys():
-        if dynamics_params[param].annotation is bool:
+        param_obj = dynamics_params[param]
+        if param_obj.annotation is bool:
             p.add_argument(
-                "--" + param,
-                type=dynamics_params[param].annotation,
-                default=False,
-                help="special dynamics_class argument",
+                "--" + param, type=param_obj.annotation, default=False, help="special dynamics_class argument"
             )
         else:
-            p.add_argument(
-                "--" + param,
-                type=dynamics_params[param].annotation,
-                required=True,
-                help="special dynamics_class argument",
-            )
+            # Check if parameter has a default value
+            has_default = param_obj.default != inspect.Parameter.empty
+            if has_default:
+                p.add_argument(
+                    "--" + param,
+                    type=param_obj.annotation,
+                    default=param_obj.default,
+                    help="special dynamics_class argument",
+                )
+            else:
+                p.add_argument(
+                    "--" + param, type=param_obj.annotation, required=True, help="special dynamics_class argument"
+                )
 
 if (mode == "all") or (mode == "test"):
     p.add_argument("--dt", type=float, default=0.0025, help="The dt used in testing simulations")
@@ -380,6 +430,20 @@ if (mode == "all") or (mode == "test"):
 
 opt = p.parse_args()
 
+# Process refinement schedule
+if opt.refinement_schedule is not None:
+    try:
+        opt.refinement_schedule_list = [float(x.strip()) for x in opt.refinement_schedule.split(",")]
+        # Validate that the schedule is sorted and starts with a positive value
+        if not all(a <= b for a, b in zip(opt.refinement_schedule_list, opt.refinement_schedule_list[1:])):
+            raise ValueError("Refinement schedule must be in ascending order")
+        if opt.refinement_schedule_list[0] <= 0:
+            raise ValueError("First refinement time must be positive")
+    except Exception as e:
+        raise ValueError(f"Invalid refinement schedule format: {e}")
+else:
+    opt.refinement_schedule_list = None
+
 # start wandb
 if use_wandb:
     wandb.init(
@@ -394,9 +458,15 @@ experiment_dir = os.path.join(opt.experiments_dir, opt.experiment_name)
 if (mode == "train") and (opt.resume_checkpoint > 0):
     experiment_dir = experiment_dir + "_cond"
 if (mode == "all") or (mode == "train"):
-    # create experiment dir
+    # create experiment dir with versioning
     if os.path.exists(experiment_dir):
-        shutil.rmtree(experiment_dir)
+        # Find the next available version number
+        version = 1
+        versioned_dir = f"{experiment_dir}_v{version}"
+        while os.path.exists(versioned_dir):
+            version += 1
+            versioned_dir = f"{experiment_dir}_v{version}"
+        experiment_dir = versioned_dir
     os.makedirs(experiment_dir)
 elif mode == "test":
     # confirm that experiment dir already exists
@@ -459,7 +529,7 @@ model = modules.SingleBVPNet(
     num_hidden_layers=orig_opt.num_hl,
     periodic_transform_fn=dynamics.periodic_transform_fn,
 )
-model.cuda()
+model.to(device)
 policy = None
 if orig_opt.pretrained_model != "none":
     model.load_state_dict(
@@ -474,8 +544,12 @@ if orig_opt.pretrained_model != "none":
                 param.requires_grad = True
             print(name, param.requires_grad)
     policy = model
+if dynamics.disturbance_dim == 0:
+    dataset_type = dataio.ReachabilityDataset
+else:
+    dataset_type = dataio.RobustReachabilityDataset
 
-dataset = dataio.ReachabilityDataset(
+dataset = dataset_type(
     dynamics=dynamics,
     numpoints=orig_opt.numpoints,
     pretrain=orig_opt.pretrain,
@@ -500,10 +574,16 @@ dataset = dataio.ReachabilityDataset(
     num_MPC_data_samples=orig_opt.num_MPC_data_samples,
     num_iterative_refinement=orig_opt.num_iterative_refinement,
     time_till_refinement=orig_opt.time_till_refinement,
+    refinement_schedule=orig_opt.refinement_schedule_list,
     num_MPC_batches=orig_opt.num_MPC_batches,
     aug_with_MPC_data=orig_opt.aug_with_MPC_data,
     policy=policy,
     refine_dataset=(not orig_opt.not_refine_dataset),
+    initiate_with_MPC=(not orig_opt.not_pretrain_MPC),
+    add_disturbance_samples=(not orig_opt.no_MPC_disturbance_samples),
+    MPC_warm_start_only=getattr(orig_opt, "MPC_warm_start_only", False),
+    warm_start_iterations=orig_opt.num_warm_start_iters,
+    full_horizon_iterations=orig_opt.num_full_horizon_iters
 )
 
 experiment_class = getattr(experiments, orig_opt.experiment_class)
