@@ -1,6 +1,7 @@
 """
-Created by Zeyuan in Dec. 14th 2023. Copied from pytorch3D since there is no conda implementation 
+Created by Zeyuan in Dec. 14th 2023. Copied from pytorch3D since there is no conda implementation
 """
+
 import torch
 
 

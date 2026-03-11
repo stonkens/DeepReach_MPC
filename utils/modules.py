@@ -7,18 +7,18 @@ import torch.nn.functional as F
 
 
 class BatchLinear(nn.Linear):
-    '''A linear layer'''
+    """A linear layer"""
+
     __doc__ = nn.Linear.__doc__
 
     def forward(self, input, params=None):
         if params is None:
             params = OrderedDict(self.named_parameters())
 
-        bias = params.get('bias', None)
-        weight = params['weight']
+        bias = params.get("bias", None)
+        weight = params["weight"]
 
-        output = input.matmul(weight.permute(
-            *[i for i in range(len(weight.shape) - 2)], -1, -2))
+        output = input.matmul(weight.permute(*[i for i in range(len(weight.shape) - 2)], -1, -2))
         output += bias.unsqueeze(-2)
         return output
 
@@ -42,24 +42,33 @@ class Saturation(nn.Module):
 
 
 class FCBlock(nn.Module):
-    '''A fully connected neural network.
-    '''
+    """A fully connected neural network."""
 
-    def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, nonlinearity='relu', weight_init=None):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        num_hidden_layers,
+        hidden_features,
+        outermost_linear=False,
+        nonlinearity="relu",
+        weight_init=None,
+    ):
         super().__init__()
 
         self.first_layer_init = None
 
         # Dictionary that maps nonlinearity name to the respective function, initialization, and, if applicable,
         # special first-layer initialization scheme
-        nls_and_inits = {'sine': (Sine(), sine_init, first_layer_sine_init),
-                         'relu': (nn.ReLU(inplace=True), init_weights_normal, None),
-                         'sigmoid': (nn.Sigmoid(), init_weights_xavier, None),
-                         'tanh': (nn.Tanh(), init_weights_xavier, None),
-                         'selu': (nn.SELU(inplace=True), init_weights_selu, None),
-                         'softplus': (nn.Softplus(), init_weights_normal, None),
-                         'elu': (nn.ELU(inplace=True), init_weights_elu, None)}
+        nls_and_inits = {
+            "sine": (Sine(), sine_init, first_layer_sine_init),
+            "relu": (nn.ReLU(inplace=True), init_weights_normal, None),
+            "sigmoid": (nn.Sigmoid(), init_weights_xavier, None),
+            "tanh": (nn.Tanh(), init_weights_xavier, None),
+            "selu": (nn.SELU(inplace=True), init_weights_selu, None),
+            "softplus": (nn.Softplus(), init_weights_normal, None),
+            "elu": (nn.ELU(inplace=True), init_weights_elu, None),
+        }
 
         nl, nl_weight_init, first_layer_init = nls_and_inits[nonlinearity]
 
@@ -69,22 +78,15 @@ class FCBlock(nn.Module):
             self.weight_init = nl_weight_init
 
         self.net = []
-        self.net.append(nn.Sequential(
-            BatchLinear(in_features, hidden_features), nl
-        ))
+        self.net.append(nn.Sequential(BatchLinear(in_features, hidden_features), nl))
 
         for i in range(num_hidden_layers):
-            self.net.append(nn.Sequential(
-                BatchLinear(hidden_features, hidden_features), nl
-            ))
+            self.net.append(nn.Sequential(BatchLinear(hidden_features, hidden_features), nl))
 
         if outermost_linear:
-            self.net.append(nn.Sequential(
-                BatchLinear(hidden_features, out_features)))
+            self.net.append(nn.Sequential(BatchLinear(hidden_features, out_features)))
         else:
-            self.net.append(nn.Sequential(
-                BatchLinear(hidden_features, out_features), nl
-            ))
+            self.net.append(nn.Sequential(BatchLinear(hidden_features, out_features), nl))
 
         self.net = nn.Sequential(*self.net)
         if self.weight_init is not None:
@@ -103,15 +105,30 @@ class FCBlock(nn.Module):
 
 
 class SingleBVPNet(nn.Module):
-    '''A canonical representation network for a BVP.'''
+    """A canonical representation network for a BVP."""
 
-    def __init__(self, out_features=1, type='sine', in_features=2,
-                 mode='mlp', hidden_features=256, num_hidden_layers=3,periodic_transform_fn=None, **kwargs):
+    def __init__(
+        self,
+        out_features=1,
+        type="sine",
+        in_features=2,
+        mode="mlp",
+        hidden_features=256,
+        num_hidden_layers=3,
+        periodic_transform_fn=None,
+        **kwargs,
+    ):
         super().__init__()
         self.mode = mode
-        self.periodic_transform_fn=periodic_transform_fn
-        self.net = FCBlock(in_features=in_features, out_features=out_features, num_hidden_layers=num_hidden_layers,
-                           hidden_features=hidden_features, outermost_linear=True, nonlinearity=type)
+        self.periodic_transform_fn = periodic_transform_fn
+        self.net = FCBlock(
+            in_features=in_features,
+            out_features=out_features,
+            num_hidden_layers=num_hidden_layers,
+            hidden_features=hidden_features,
+            outermost_linear=True,
+            nonlinearity=type,
+        )
         # self.fct = nn.Linear(1, 1)
 
         print(self)
@@ -121,21 +138,28 @@ class SingleBVPNet(nn.Module):
             params = OrderedDict(self.named_parameters())
 
         # Enables us to compute gradients w.r.t. coordinates
-        coords_org = model_input['coords'].clone(
-        ).detach().requires_grad_(True)
-        coords_transformed=self.periodic_transform_fn(coords_org)
+        coords_org = model_input["coords"].clone().detach().requires_grad_(True)
+        coords_transformed = self.periodic_transform_fn(coords_org)
         output = self.net(coords_transformed)
-        return {'model_in': coords_org, 'model_out': output}
+        return {"model_in": coords_org, "model_out": output}
+
 
 class SingleBVPNetEval(nn.Module):
-    '''A canonical representation network for a BVP.'''
+    """A canonical representation network for a BVP."""
 
-    def __init__(self, out_features=1, type='sine', in_features=2,
-                 mode='mlp', hidden_features=256, num_hidden_layers=3, **kwargs):
+    def __init__(
+        self, out_features=1, type="sine", in_features=2, mode="mlp", hidden_features=256, num_hidden_layers=3, **kwargs
+    ):
         super().__init__()
         self.mode = mode
-        self.net = FCBlock(in_features=in_features, out_features=out_features, num_hidden_layers=num_hidden_layers,
-                           hidden_features=hidden_features, outermost_linear=True, nonlinearity=type)
+        self.net = FCBlock(
+            in_features=in_features,
+            out_features=out_features,
+            num_hidden_layers=num_hidden_layers,
+            hidden_features=hidden_features,
+            outermost_linear=True,
+            nonlinearity=type,
+        )
         # self.fct = nn.Linear(1, 1)
         # print(self)
 
@@ -143,19 +167,26 @@ class SingleBVPNetEval(nn.Module):
         if params is None:
             params = OrderedDict(self.named_parameters())
 
-        output = self.net(model_input['coords'])
-        return {'model_in': model_input['coords'], 'model_out': output}
+        output = self.net(model_input["coords"])
+        return {"model_in": model_input["coords"], "model_out": output}
 
 
 class SingleBVPNet2(nn.Module):
-    '''A canonical representation network for a BVP.'''
+    """A canonical representation network for a BVP."""
 
-    def __init__(self, out_features=1, type='sine', in_features=2,
-                 mode='mlp', hidden_features=256, num_hidden_layers=3, **kwargs):
+    def __init__(
+        self, out_features=1, type="sine", in_features=2, mode="mlp", hidden_features=256, num_hidden_layers=3, **kwargs
+    ):
         super().__init__()
         self.mode = mode
-        self.net = FCBlock(in_features=in_features, out_features=out_features, num_hidden_layers=num_hidden_layers,
-                           hidden_features=hidden_features, outermost_linear=True, nonlinearity=type)
+        self.net = FCBlock(
+            in_features=in_features,
+            out_features=out_features,
+            num_hidden_layers=num_hidden_layers,
+            hidden_features=hidden_features,
+            outermost_linear=True,
+            nonlinearity=type,
+        )
         self.fct = nn.Linear(1, 1)
         print(self)
 
@@ -164,17 +195,15 @@ class SingleBVPNet2(nn.Module):
             params = OrderedDict(self.named_parameters())
 
         # Enables us to compute gradients w.r.t. coordinates
-        coords_org = model_input['coords'].clone(
-        ).detach().requires_grad_(True)
+        coords_org = model_input["coords"].clone().detach().requires_grad_(True)
         t_values = self.fct(coords_org[..., [0]])
-        t_values = torch.minimum(torch.maximum(t_values, torch.zeros_like(
-            t_values)), torch.ones_like(t_values))
+        t_values = torch.minimum(torch.maximum(t_values, torch.zeros_like(t_values)), torch.ones_like(t_values))
         try:
             coords = torch.cat((t_values, coords_org[..., 1:]), dim=2)
         except:
             coords = torch.cat((t_values, coords_org[..., 1:]), dim=1)
         output = self.net(coords)
-        return {'model_in': coords_org, 'model_out': output}
+        return {"model_in": coords_org, "model_out": output}
 
 
 class Combined_model(nn.Module):
@@ -190,7 +219,7 @@ class Combined_model(nn.Module):
         # coords_aug = torch.cat((coords_org,v), dim=2)
         # result=self.modelB({'coords': coords_aug.cuda()})
         # return {'model_in': coords_org, 'model_out': result['model_out']}
-        coords_org = x['coords'].clone().detach().requires_grad_(True)
+        coords_org = x["coords"].clone().detach().requires_grad_(True)
         v = self.modelA.net(coords_org)
 
         try:
@@ -198,51 +227,48 @@ class Combined_model(nn.Module):
         except:
             coords_aug = torch.cat((coords_org, v), dim=1)
         output = self.modelB.net(coords_aug)
-        return {'model_in': coords_org, 'model_out': output}
+        return {"model_in": coords_org, "model_out": output}
 
 
 ########################
 # Initialization methods
 def init_weights_normal(m):
     if type(m) == BatchLinear or type(m) == nn.Linear:
-        if hasattr(m, 'weight'):
-            nn.init.kaiming_normal_(
-                m.weight, a=0.0, nonlinearity='relu', mode='fan_in')
+        if hasattr(m, "weight"):
+            nn.init.kaiming_normal_(m.weight, a=0.0, nonlinearity="relu", mode="fan_in")
 
 
 def init_weights_selu(m):
     if type(m) == BatchLinear or type(m) == nn.Linear:
-        if hasattr(m, 'weight'):
+        if hasattr(m, "weight"):
             num_input = m.weight.size(-1)
             nn.init.normal_(m.weight, std=1 / math.sqrt(num_input))
 
 
 def init_weights_elu(m):
     if type(m) == BatchLinear or type(m) == nn.Linear:
-        if hasattr(m, 'weight'):
+        if hasattr(m, "weight"):
             num_input = m.weight.size(-1)
-            nn.init.normal_(m.weight, std=math.sqrt(
-                1.5505188080679277) / math.sqrt(num_input))
+            nn.init.normal_(m.weight, std=math.sqrt(1.5505188080679277) / math.sqrt(num_input))
 
 
 def init_weights_xavier(m):
     if type(m) == BatchLinear or type(m) == nn.Linear:
-        if hasattr(m, 'weight'):
+        if hasattr(m, "weight"):
             nn.init.xavier_normal_(m.weight)
 
 
 def sine_init(m):
     with torch.no_grad():
-        if hasattr(m, 'weight'):
+        if hasattr(m, "weight"):
             num_input = m.weight.size(-1)
             # See supplement Sec. 1.5 for discussion of factor 30
-            m.weight.uniform_(-np.sqrt(6 / num_input) / 30,
-                              np.sqrt(6 / num_input) / 30)
+            m.weight.uniform_(-np.sqrt(6 / num_input) / 30, np.sqrt(6 / num_input) / 30)
 
 
 def first_layer_sine_init(m):
     with torch.no_grad():
-        if hasattr(m, 'weight'):
+        if hasattr(m, "weight"):
             num_input = m.weight.size(-1)
             # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of factor 30
             m.weight.uniform_(-1 / num_input, 1 / num_input)
