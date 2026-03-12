@@ -1301,7 +1301,7 @@ class Experiment(ABC):
             self.dataset.policy = self.model
 
             # Generate new dataset
-            if refine_till_t < self.dataset.tMax:
+            if self.last_refine_time < self.dataset.tMax:
                 self.dataset.generate_MPC_dataset(refine_till_t, self.last_refine_time, style="random")
             else:  # take extra care when time curriculum end, and transition to finetuning phase
                 self.dataset.use_terminal_MPC()
