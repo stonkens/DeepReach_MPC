@@ -387,7 +387,7 @@ class VertDrone2D(Dynamics):
         self.state_range_ = torch.tensor([[-4, 4], [-0.5, 3.5]]).to(device)  # v, z, k
         self.control_range_ = torch.tensor([[-self.input_magnitude_max, self.input_magnitude_max]]).to(device)
         self.eps_var_control = torch.tensor([2]).to(device)
-        self.control_init = (torch.ones(1) * self.gravity / self.input_multiplier).to(device)
+        self.control_init = torch.ones(1).to(device) * self.gravity / self.input_multiplier
 
         state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
         state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
@@ -519,7 +519,7 @@ class ParameterizedVertDrone2D(Dynamics):
         self.state_range_ = torch.tensor([[-4, 4], [-0.5, 3.5], [0, self.input_multiplier]]).to(device)  # v, z, k
         self.control_range_ = torch.tensor([[-self.input_magnitude_max, self.input_magnitude_max]]).to(device)
         self.eps_var_control = torch.tensor([2]).to(device)
-        self.control_init = (torch.ones(1) * gravity / input_multiplier).to(device)
+        self.control_init = torch.ones(1).to(device) * gravity / input_multiplier
 
         state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
         state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
@@ -1430,7 +1430,6 @@ class F1tenth(Dynamics):
         return ham
 
     def optimal_control(self, state, dvds):
-
         if self.set_mode == "reach":
             raise NotImplementedError
         elif self.set_mode == "avoid":
@@ -1609,7 +1608,9 @@ class LessLinearND(Dynamics):
             - torch.cat((torch.cat((torch.zeros(1, 1), torch.ones(N - 1, 1)), 0), torch.zeros(N, N - 1)), 1)
         ).to(device)
         self.B = torch.cat((torch.zeros(1, N - 1), 0.4 * torch.eye(N - 1)), 0).to(device)
-        self.Bumax = u_max * torch.matmul(self.B, torch.ones(self.N - 1).to(device)).unsqueeze(0).unsqueeze(0).to(device)
+        self.Bumax = u_max * torch.matmul(self.B, torch.ones(self.N - 1).to(device)).unsqueeze(0).unsqueeze(0).to(
+            device
+        )
         self.C = torch.cat((torch.zeros(1, N - 1), 0.1 * torch.eye(N - 1)), 0)
         self.gamma, self.mu, self.alpha = gamma, mu, alpha
         self.gamma_orig, self.mu_orig, self.alpha_orig = gamma, mu, alpha
@@ -1707,7 +1708,6 @@ class LessLinearND(Dynamics):
         return torch.min(self.boundary_fn(state_traj), dim=-1).values
 
     def hamiltonian(self, state, dvds):
-
         nl_term_N = (self.mu * torch.sin(self.alpha * state[..., 0]) * state[..., 0] * state[..., 0]).unsqueeze(-1)
         nl_term_i = (-self.gamma * state[..., 0] * state[..., 0]).t() * state[..., 1:]
         pAx = (dvds * (torch.matmul(state, self.A.t()) + torch.cat((nl_term_N, nl_term_i), 2))).sum(2)
