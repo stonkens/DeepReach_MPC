@@ -83,9 +83,13 @@ class SampleGenerator(ABC):
 
 
 class SliceSampleGenerator(SampleGenerator):
-    def __init__(self, dynamics, slices):
+    def __init__(self, dynamics, slices, generator=None):
         self.dynamics = dynamics
         self.slices = slices
+        if generator is not None and isinstance(generator, int):
+            self.generator = torch.Generator().manual_seed(generator)
+        else:
+            self.generator = generator
         assert self.dynamics.state_dim == len(slices)
 
     def sample(self, num_samples):
@@ -95,7 +99,12 @@ class SliceSampleGenerator(SampleGenerator):
             samples_ = torch.zeros(num_samples, self.dynamics.state_dim)
             for dim in range(self.dynamics.state_dim):
                 if self.slices[dim] is None:
-                    samples_[:, dim].uniform_(*self.dynamics.state_verification_range()[dim])
+                    if self.generator is not None:
+                        samples_[:, dim].uniform_(
+                            *self.dynamics.state_verification_range()[dim], generator=self.generator
+                        )
+                    else:
+                        samples_[:, dim].uniform_(*self.dynamics.state_verification_range()[dim])
                 else:
                     samples_[:, dim] = self.slices[dim]
             if self.dynamics.name == "Quadrotor":

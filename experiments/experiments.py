@@ -37,12 +37,15 @@ else:
 
 
 class Experiment(ABC):
-    def __init__(self, model, dataset, experiment_dir, use_wandb, run_training_validation):
+    def __init__(self, model, dataset, experiment_dir, use_wandb, run_training_validation, validation_seed):
         self.model = model
         self.dataset = dataset
         self.experiment_dir = experiment_dir
         self.use_wandb = use_wandb
         self.run_training_validation = run_training_validation
+        if self.run_training_validation:
+            self.validation_seed = validation_seed
+            self.cached_validation_states = None
         ## Dynamic Weighting
         self.loss_weights = {"dirichlet": 1.0, "mpc_loss": 1.0, "diff_constraint_hom": 1.0}
 
@@ -135,7 +138,6 @@ class Experiment(ABC):
 
         with tqdm(total=len(train_dataloader) * epochs) as pbar:
             train_losses = []
-            first_time_generated = True
             # self.dataset.counter = 0
             for epoch in range(0, epochs):
                 # if current epochs exceed the counter end, then we train with t \in [tMin,tMax]
@@ -291,11 +293,7 @@ class Experiment(ABC):
                         (self.dataset.counter + 1) / self.dataset.counter_end, 1.0
                     )
                     if self.run_training_validation:
-                        if first_time_generated:
-                            cached_validation_states = None
-                            first_time_generated = False
-
-                        cached_validation_states = run_training_validation(
+                        self.cached_validation_states = run_training_validation(
                             model=self.model,
                             dynamics=self.dataset.dynamics,
                             tMin=self.dataset.tMin,
@@ -303,7 +301,8 @@ class Experiment(ABC):
                             current_time=current_time,
                             use_wandb=self.use_wandb,
                             epoch=epoch + 1,
-                            cached_states=cached_validation_states if not first_time_generated else None,
+                            cached_states=self.cached_validation_states,
+                            seed=self.validation_seed,
                         )
 
         torch.save(

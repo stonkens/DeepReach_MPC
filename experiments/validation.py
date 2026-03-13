@@ -14,7 +14,7 @@ from utils.error_evaluators import (
 )
 
 
-def _generate_validated_states(dynamics, num_states=10000, num_candidates=50000, v_min=0.0, v_max=2.0):
+def _generate_validated_states(dynamics, num_states=10000, num_candidates=50000, v_min=0.0, v_max=2.0, seed=100):
     """Generate states that pass boundary value validation.
 
     Samples uniformly from the state space and filters to states whose
@@ -31,7 +31,11 @@ def _generate_validated_states(dynamics, num_states=10000, num_candidates=50000,
         Tensor of shape (num_states, state_dim) with validated states.
     """
     validator = ValueThresholdValidator(v_min=float(v_min), v_max=float(v_max))
-    generator = SliceSampleGenerator(dynamics=dynamics, slices=[None] * dynamics.state_dim)
+    generator = SliceSampleGenerator(
+        dynamics=dynamics,
+        slices=[None] * dynamics.state_dim,
+        generator=seed,
+    )
     states = []
     while len(states) < num_states:
         candidates = generator.sample(num_candidates)
@@ -42,7 +46,7 @@ def _generate_validated_states(dynamics, num_states=10000, num_candidates=50000,
     return torch.stack(states)
 
 
-def run_training_validation(model, dynamics, tMin, tMax, current_time, use_wandb, epoch, cached_states=None):
+def run_training_validation(model, dynamics, tMin, tMax, current_time, use_wandb, epoch, cached_states=None, seed=100):
     """Run scenario optimization at multiple time horizons during training.
 
     Evaluates the learned value function at 25%, 50%, 75%, 100% of tMax
@@ -66,18 +70,15 @@ def run_training_validation(model, dynamics, tMin, tMax, current_time, use_wandb
     # Generate or reuse validated states
     if cached_states is None:
         cached_states = {
-            "states_25p": _generate_validated_states(dynamics),
-            "states_50p": _generate_validated_states(dynamics),
-            "states_75p": _generate_validated_states(dynamics),
-            "states_100p": _generate_validated_states(dynamics),
-            "states_5s": _generate_validated_states(dynamics),
+            "states_25p": _generate_validated_states(dynamics, seed=seed),
+            "states_50p": _generate_validated_states(dynamics, seed=seed),
+            "states_75p": _generate_validated_states(dynamics, seed=seed),
+            "states_100p": _generate_validated_states(dynamics, seed=seed),
+            "states_5s": _generate_validated_states(dynamics, seed=seed),
         }
 
     # Create fixed-state generators from cached states
-    generators = {
-        key: FixedStateSampleGenerator(dynamics=dynamics, states=cached_states[key])
-        for key in cached_states
-    }
+    generators = {key: FixedStateSampleGenerator(dynamics=dynamics, states=cached_states[key]) for key in cached_states}
 
     # Compute time horizons (aligned to dt)
     dt = 0.02
