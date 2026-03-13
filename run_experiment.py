@@ -336,6 +336,10 @@ if (mode == "all") or (mode == "train"):
         "--val_time_resolution", type=int, default=6, help="time-axis resolution of validation plot during training"
     )
 
+    p.add_argument(
+        "--run_training_validation", default=False, action="store_true", help="run validation during training"
+    )
+
     # loss options
     p.add_argument(
         "--minWith",
@@ -583,11 +587,17 @@ dataset = dataset_type(
     add_disturbance_samples=(not orig_opt.no_MPC_disturbance_samples),
     MPC_warm_start_only=getattr(orig_opt, "MPC_warm_start_only", False),
     warm_start_iterations=orig_opt.num_warm_start_iters,
-    full_horizon_iterations=orig_opt.num_full_horizon_iters
+    full_horizon_iterations=orig_opt.num_full_horizon_iters,
 )
 
 experiment_class = getattr(experiments, orig_opt.experiment_class)
-experiment = experiment_class(model=model, dataset=dataset, experiment_dir=experiment_dir, use_wandb=use_wandb)
+experiment = experiment_class(
+    model=model,
+    dataset=dataset,
+    experiment_dir=experiment_dir,
+    use_wandb=use_wandb,
+    run_training_validation=orig_opt.run_training_validation,
+)
 experiment.init_special(
     **{
         argname: getattr(orig_opt, argname)

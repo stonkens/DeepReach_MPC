@@ -37,11 +37,12 @@ else:
 
 
 class Experiment(ABC):
-    def __init__(self, model, dataset, experiment_dir, use_wandb):
+    def __init__(self, model, dataset, experiment_dir, use_wandb, run_training_validation):
         self.model = model
         self.dataset = dataset
         self.experiment_dir = experiment_dir
         self.use_wandb = use_wandb
+        self.run_training_validation = run_training_validation
         ## Dynamic Weighting
         self.loss_weights = {"dirichlet": 1.0, "mpc_loss": 1.0, "diff_constraint_hom": 1.0}
 
@@ -289,20 +290,22 @@ class Experiment(ABC):
                     current_time = (self.dataset.tMax - self.dataset.tMin) * min(
                         (self.dataset.counter + 1) / self.dataset.counter_end, 1.0
                     )
-                    if first_time_generated:
-                        cached_validation_states = None
-                        first_time_generated = False
-                    cached_validation_states = run_training_validation(
-                        model=self.model,
-                        dynamics=self.dataset.dynamics,
-                        tMin=self.dataset.tMin,
-                        tMax=self.dataset.tMax,
-                        current_time=current_time,
-                        use_wandb=self.use_wandb,
-                        epoch=epoch + 1,
-                        cached_states=cached_validation_states if not first_time_generated else None,
-                    )
- 
+                    if self.run_training_validation:
+                        if first_time_generated:
+                            cached_validation_states = None
+                            first_time_generated = False
+
+                        cached_validation_states = run_training_validation(
+                            model=self.model,
+                            dynamics=self.dataset.dynamics,
+                            tMin=self.dataset.tMin,
+                            tMax=self.dataset.tMax,
+                            current_time=current_time,
+                            use_wandb=self.use_wandb,
+                            epoch=epoch + 1,
+                            cached_states=cached_validation_states if not first_time_generated else None,
+                        )
+
         torch.save(
             {"model": self.model.state_dict()}, os.path.join(checkpoints_dir, "model_final.pth")
         )  # save final model

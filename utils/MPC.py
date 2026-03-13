@@ -1,12 +1,3 @@
-"""Cleaned MPC implementation.
-
-Refactored from MPC.py with:
-- Generic _rollout method replacing 3 separate rollout methods
-- Merged optimize() replacing warm_start_with_policy + get_control / get_control_and_disturbance
-- Extracted _select_best() eliminating duplicated selection logic
-- Removed all commented-out code, gaussian+gaussian branches, broken MPPI mode
-"""
-
 import torch
 from tqdm import tqdm
 import math
@@ -24,7 +15,6 @@ class MPC:
     """Model Predictive Control for single-agent (control-only) systems.
 
     Uses the same refactored pattern as RobustMPC:
-      - _rollout(): generic forward rollout (sample / policy / fixed modes)
       - optimize(): unified sample-and-select loop
       - _select_best(): select best sample and update tensors
     """
@@ -186,11 +176,10 @@ class MPC:
         Returns:
             (state_trajs, boundary_tuple)
         """
-        best_trajs, _ = self._rollout(
+        best_trajs, _ = self._rollout_deterministic_policy(
             init_state,
             t_start=self.horizon * self.dT,
             horizon=self.horizon,
-            mode="policy",
             start_iter=0,
         )
         boundary_tuple = self.dynamics_.get_boundary_values_tuple(best_trajs)
@@ -221,13 +210,12 @@ class MPC:
                     t_remaining=self.t,
                     horizon=self.incremental_horizon,
                 )
-            else:
+            elif self.policy is not None:
                 # Only do deterministic rollout from self.T to 0 (policy)
-                best_trajs, _ = self._rollout(
+                best_trajs, _ = self._rollout_deterministic_policy(
                     init_state,
                     t_start=self.horizon * self.dT,
                     horizon=self.horizon,
-                    mode="policy",
                     start_iter=0,
                 )
 
@@ -289,6 +277,10 @@ class MPC:
             raise ValueError(f"Unknown style {self.style}")
 
     def set_control_tensors(self, control_tensors, start_iter, end_iter):
+        """
+        Current "optimal" control tensor [B, H, D] updated.
+        Only gets queried in other methods for rollout.
+        """
         self.control_tensors[:, start_iter:end_iter] = control_tensors
 
     def optimize(self, init_state, t_start, num_iters, t_remaining=None, horizon=None):
@@ -307,11 +299,10 @@ class MPC:
         best_traj = None
         for _ in range(num_iters):
             # 1. Sample and rollout
-            state_trajs, inputs_tuple = self._rollout(
+            state_trajs, inputs_tuple = self._rollout_with_sampling(
                 init_state,
                 t_start,
                 horizon=horizon,
-                mode="sample",
                 start_iter=0,
             )
             # 2. Compute costs over trajectory
@@ -319,7 +310,8 @@ class MPC:
 
             # 3. Optionally add terminal VF cost
             if t_remaining > 0:
-                terminal_values = self._eval_vf(state_trajs, t_remaining)
+                terminal_states = state_trajs[:, :, -1]
+                terminal_values = self._eval_vf(terminal_states, t_remaining)
                 if horizon > 0:
                     costs = torch.minimum(costs, terminal_values)
                     if self.dynamics_.set_mode == "reach_avoid":
@@ -337,42 +329,21 @@ class MPC:
         if t_remaining > 0:
             remaining_horizon = self.horizon - horizon
             best_final_state = best_traj[:, -1, :]
-            remaining_traj, _ = self._rollout(
+            remaining_traj, _ = self._rollout_deterministic_policy(
                 best_final_state,
                 t_start=remaining_horizon * self.dT,
                 horizon=remaining_horizon,
-                mode="policy",
                 start_iter=horizon,
             )
             best_traj = torch.cat([best_traj[:, :-1, :], remaining_traj], dim=1)
         return best_traj
 
-    def get_control(self, init_state, t_start=None):
-        """Used by test_MPC_base_equivalence.py for exact extraction."""
-        if t_start is None:
-            t_start = self.horizon * self.dT
-        state_trajs, inputs_tuple = self._rollout(
-            init_state,
-            t_start,
-            horizon=self.horizon,
-            mode="sample",
-            start_iter=0,
-        )
-        _ = self._select_best(
-            costs=self.dynamics_.cost_fn(state_trajs),
-            inputs_tuple=inputs_tuple,
-            state_trajs=state_trajs,
-            style_override="receding",
-        )
-        return self.control_tensors[:, 0, :]
-
     def _optimize_receding(self, init_state, t_start=None):
         """Single-iteration sample-and-select for receding horizon style."""
-        state_trajs, inputs_tuple = self._rollout(
+        state_trajs, inputs_tuple = self._rollout_with_sampling(
             init_state,
             t_start,
             horizon=self.horizon - self.receding_start,
-            control_mode="sample",
             start_iter=self.receding_start,
         )
         best_traj = self._select_best(
@@ -383,29 +354,6 @@ class MPC:
         )
         current_controls = self.control_tensors[:, self.receding_start : self.receding_start + self.receding_horizon, :]
         return current_controls, best_traj
-
-    def _rollout(self, init_state, t_start, horizon, mode, start_iter=0):
-        """Generic forward rollout wrapper.
-
-        Args:
-            init_state: [B, D] initial states
-            horizon: Number of timesteps
-            mode: "sample" (perturb around nominal), "policy" (query optimal),
-                         or "fixed" (use current tensors as-is)
-            start_iter: Starting index for control tensor slicing
-
-        Returns:
-            For "sample": (state_trajs [B,N,H+1,D], input_tensors tuple with shapes [B,N,H,Du])
-            For "policy"/"fixed": state_trajs [B,H+1,D], input_tensors tuple with shapes [B,H,Du]
-        """
-        if mode == "sample":
-            return self._rollout_with_sampling(init_state, t_start, horizon, start_iter)
-        elif mode == "policy":
-            return self._rollout_deterministic_policy(init_state, t_start, horizon, start_iter)
-        elif mode == "fixed":
-            return self.rollout_nominal_trajs(init_state, t_start, horizon)
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
 
     def _rollout_with_sampling(self, init_state, t_start, horizon, start_iter, eps_var_factor=1):
         """Rollout with sampled perturbations around nominal controls."""
@@ -524,19 +472,19 @@ class MPC:
 
         return best_traj
 
-    def _eval_vf(self, state_trajs, t_eval):
+    def _eval_vf(self, terminal_states, t_eval):
         """Evaluate learned value function at terminal states.
 
         Args:
-            state_trajs: [B, N, H+1, D] sampled trajectories
+            terminal_states: [B, N, D] terminal states
             t_eval: Time at which to evaluate the VF
 
         Returns:
             terminal_values: [B, N] value estimates at the final state
         """
         traj_times = torch.ones(self.batch_size, self.num_samples, 1).to(self.device) * t_eval
-        state_trajs_clamped = self.dynamics_.clip_state(state_trajs[:, :, -1, :])
-        traj_coords = torch.cat((traj_times, state_trajs_clamped), dim=-1)
+        terminal_states_clamped = self.dynamics_.clip_state(terminal_states)
+        traj_coords = torch.cat((traj_times, terminal_states_clamped), dim=-1)
         traj_policy_results = self.policy({"coords": self.policy_dynamics_.coord_to_input(traj_coords.to(self.device))})
         terminal_values = self.policy_dynamics_.io_to_value(
             traj_policy_results["model_in"].detach(),

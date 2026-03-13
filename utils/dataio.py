@@ -85,7 +85,7 @@ class ReachabilityDataset(Dataset):
         add_disturbance_samples=False,
         MPC_warm_start_only=False,
         warm_start_iterations=0,
-        full_horizon_iterations=0
+        full_horizon_iterations=0,
     ):
         self.dynamics = dynamics
         self.numpoints = numpoints
@@ -243,7 +243,7 @@ class ReachabilityDataset(Dataset):
             num_iterative_refinement=self.num_iterative_refinement,
             warm_start_only=self.MPC_warm_start_only,
             num_warm_start_iters=self.warm_start_iterations,
-            num_full_horizon_iters=self.full_horizon_iterations
+            num_full_horizon_iters=self.full_horizon_iterations,
         )
         MPC_inputs, MPC_values = self.collect_MPC_io(mpc_fn, T, t, style=style)
 
@@ -398,7 +398,7 @@ class RobustReachabilityDataset(ReachabilityDataset):
             num_iterative_refinement=self.num_iterative_refinement,
             warm_start_only=self.MPC_warm_start_only,
             num_warm_start_iters=self.warm_start_iterations,
-            num_full_horizon_iters=self.full_horizon_iterations
+            num_full_horizon_iters=self.full_horizon_iterations,
         )
         mpc_input_control, MPC_values_control = self.collect_MPC_io(mpc_control_fn, T, t, style=style)
         mpc_disturbance_fn = MPC.RobustMPC(
@@ -416,7 +416,7 @@ class RobustReachabilityDataset(ReachabilityDataset):
             num_iterative_refinement=self.num_iterative_refinement,
             warm_start_only=self.MPC_warm_start_only,
             num_warm_start_iters=self.warm_start_iterations,
-            num_full_horizon_iters=self.full_horizon_iterations
+            num_full_horizon_iters=self.full_horizon_iterations,
         )
         if self.add_disturbance_samples:
             mpc_input_disturbance, MPC_values_disturbance = self.collect_MPC_io(mpc_disturbance_fn, T, t, style=style)
