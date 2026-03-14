@@ -339,6 +339,7 @@ if (mode == "all") or (mode == "train"):
     p.add_argument(
         "--run_training_validation", default=False, action="store_true", help="run validation during training"
     )
+    p.add_argument("--validation_seed", type=int, default=100, help="seed for validation")
 
     # loss options
     p.add_argument(
@@ -597,6 +598,7 @@ experiment = experiment_class(
     experiment_dir=experiment_dir,
     use_wandb=use_wandb,
     run_training_validation=orig_opt.run_training_validation,
+    validation_seed=orig_opt.validation_seed,
 )
 experiment.init_special(
     **{
